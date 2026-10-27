@@ -1,0 +1,1974 @@
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    private static readonly Dictionary<int, DeviceInfo> Devices = new();
+    private static readonly object DeviceLock = new();
+    private static readonly object SimulationLock = new();
+    private static readonly object LogLock = new();
+    private static StreamWriter? movementLog;
+    private static string movementLogPath = "";
+    private static DateTime lastMovementConsole = DateTime.MinValue;
+    private static string lastMovementConsoleController = "";
+
+    static void StartMovementLog()
+    {
+        try
+        {
+            string folder = Path.Combine(AppContext.BaseDirectory, "logs");
+            Directory.CreateDirectory(folder);
+            movementLogPath = Path.Combine(folder, "MDRG_Depth_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt");
+            lock (LogLock)
+            {
+                movementLog = new StreamWriter(new FileStream(movementLogPath, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
+                movementLog.WriteLine("MDRG Bridge v3.7.5 diagnostic log - " + DateTime.Now.ToString("O"));
+            }
+            Console.WriteLine("[LOG] Movement data saved to: " + movementLogPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[LOG ERROR] File logging unavailable: " + ex.Message);
+        }
+    }
+
+    static void LogMovement(string message)
+    {
+        lock (LogLock)
+        {
+            try { movementLog?.WriteLine(DateTime.Now.ToString("O") + " " + message); }
+            catch (Exception ex)
+            {
+                movementLog?.Dispose();
+                movementLog = null;
+                Console.WriteLine("[LOG ERROR] Logging stopped: " + ex.Message);
+            }
+        }
+    }
+
+    static void PrintArmingDiagnostics()
+    {
+        lock (SimulationLock)
+            Console.WriteLine($"[ARM DIAGNOSTICS] armed={physicalArmed} heartbeatFresh={gameActive && (DateTime.UtcNow-lastGameHeartbeat).TotalSeconds < HeartbeatDisconnectSeconds} stopLatch={emergencyStopped} autoArmBlocked={autoArmBlocked} outputHealthy={outputLoopHealthy} channels={Motors.Count}");
+    }
+
+    private static double currentIntensity = 0;
+    private static double targetIntensity = 0;
+    private static double transitionSpeed = 40;
+    private static double inactivityTimeout = 15;
+    private static DateTime lastIntensityUpdate = DateTime.MinValue;
+    private static bool receivingMovement = false;
+    private static string movementController = "";
+    private static int movementHandler = -1;
+    private static double movementSpeed = 0;
+    private static double movementTarget = 0;
+    private static double movementSmoothed = 0;
+    private static bool depthPositionValid = false;
+    private static double depthRawPosition = 0;
+    private static double normalizedDepth = 0;
+    private static bool normalizedDepthValid = false;
+    private static string depthCalibration = "unknown";
+    private static readonly Dictionary<string, DepthStats> DepthByController = new();
+    private static readonly Dictionary<string, DepthStats> DepthByHandler = new();
+
+    private sealed class DepthStats
+    {
+        public long Samples;
+        public long Invalid;
+        public long NegativeOne;
+        public long Increasing;
+        public long Decreasing;
+        public long Unchanged;
+        public bool HasPrevious;
+        public double Previous;
+        public double Minimum = double.PositiveInfinity;
+        public double Maximum = double.NegativeInfinity;
+    }
+
+    private static void RecordDepth(DepthStats stats, bool valid, double raw)
+    {
+        stats.Samples++;
+        if (!valid || !double.IsFinite(raw))
+        {
+            stats.Invalid++;
+            stats.HasPrevious = false;
+            return;
+        }
+        stats.Minimum = Math.Min(stats.Minimum, raw);
+        stats.Maximum = Math.Max(stats.Maximum, raw);
+        if (raw == -1) stats.NegativeOne++;
+        if (stats.HasPrevious)
+        {
+            double delta = raw - stats.Previous;
+            if (delta > 0.0001) stats.Increasing++;
+            else if (delta < -0.0001) stats.Decreasing++;
+            else stats.Unchanged++;
+        }
+        stats.Previous = raw;
+        stats.HasPrevious = true;
+    }
+
+    private static void PrintDepthStats()
+    {
+        lock (SimulationLock)
+        {
+            Console.WriteLine("\n[DEPTH DIAGNOSTICS] Per-controller / per-handler observed ranges");
+            foreach (var entry in DepthByController)
+                PrintDepthRow(entry.Key, entry.Value);
+            Console.WriteLine("[BY HANDLER]");
+            foreach (var entry in DepthByHandler)
+                PrintDepthRow(entry.Key, entry.Value);
+            Console.WriteLine("Observed ranges are NOT calibration endpoints. Physical output remains safety capped.\n");
+        }
+    }
+
+    private static void PrintDepthRow(string name, DepthStats stats)
+    {
+        string range = stats.Samples == stats.Invalid ? "N/A" :
+            stats.Minimum.ToString("F4", CultureInfo.InvariantCulture) + ".." +
+            stats.Maximum.ToString("F4", CultureInfo.InvariantCulture);
+        Console.WriteLine(name + " | samples=" + stats.Samples +
+            " invalid=" + stats.Invalid + " raw=" + range +
+            " at-1=" + stats.NegativeOne + " up=" + stats.Increasing +
+            " down=" + stats.Decreasing + " steady=" + stats.Unchanged);
+    }
+
+    // Diagnostic calibration only. These are provisional, not validated endpoints.
+    // Do not use normalized depth to drive physical actuators yet.
+    private static bool TryNormalizeDepth(string controller, int handler,
+        bool positionValid, double raw, out double normalized, out string calibration)
+    {
+        normalized = 0;
+        calibration = "unknown";
+        if (handler < 0 || !positionValid || !double.IsFinite(raw)) return false;
+        if (controller == "Live2DBlowjobController")
+        {
+            calibration = "blowjob calibrated [0.2000,0.8500]";
+            if (raw < 0 || raw > 1) return false;
+            normalized = Math.Clamp((raw - 0.2000) / (0.8500 - 0.2000), 0, 1) * 100;
+            return true;
+        }
+        if (controller == "Live2DCowgirlController" ||
+            controller == "Live2DDoggyFuckController" ||
+            controller == "Live2DMissionaryFuckController")
+        {
+            calibration = "signed [-1,1] provisional";
+            if (raw < -1 || raw > 1) return false;
+            normalized = (raw + 1) * 50;
+            return true;
+        }
+        return false;
+    }
+
+
+    private static DateTime lastGameHeartbeat = DateTime.MinValue;
+    private static bool gameActive = false;
+
+    private static readonly List<LinearSetting> LinearAxes = new();
+    class LinearSetting
+    {
+        public string Name;
+        public int DeviceIndex, FeatureIndex;
+        public bool Enabled = true; // Auto-enable discovered linear axes; global stop/disarm and heartbeat safety remain active.
+        public double Min = 0.0, Max = 1.0; // Full simulator travel; adjust before using physical hardware.
+        public bool Reverse = false;
+        public int DurationMs = 100;
+        public double WaveSmoothSeconds = 0.10; // Exponential smoothing of depth-position target.
+        public double LastPosition = double.NaN;
+        public LinearSetting(string name, int device, int feature)
+        { Name=name; DeviceIndex=device; FeatureIndex=feature; }
+    }
+    // Populated dynamically from Intiface DeviceList/DeviceAdded. Each vibration
+    // actuator gets its own independently configurable channel.
+    private static readonly List<MotorSetting> Motors = new();
+    private static bool emergencyStopped = false;
+    private static bool autoArmBlocked = false;
+    private static bool onInteractionScreen = false;
+    private static bool physicalArmed = false; // Auto-arms when device and fresh game heartbeat are available.
+    private static DateTime pauseStarted = DateTime.MinValue;
+
+    private const double HeartbeatDisconnectSeconds = 5.0;
+    private static double ZeroSpeedThreshold = 0.05; // Ignore low-speed noise when deciding whether depth vibration should be active.
+    private static readonly SemaphoreSlim SendLock = new(1, 1);
+    private static int commandId = 100;
+    private static readonly object OutputLock = new();
+    private static bool outputLoopHealthy = true;
+
+    class MotorSetting
+    {
+        public string Name;
+        public int DeviceIndex;
+        public int FeatureIndex;
+        public bool Enabled = true;
+        public double Multiplier = 0.5;
+        public double MaxPercent = 100;
+        public string Source = "hybrid"; // Default for all controllers, including blowjob.
+        public string EjacMode = "shot-override"; // Default: normal movement, with shot pulses overriding during climax.
+        public double EjacIntensity = 60; // percent, bounded by existing motor cap
+        public double EjacPulse = 0.25; // seconds per pulse cycle
+        public double EjacFade = 0.15; // seconds after event end
+        public bool IdleEnabled = false;
+        public double IdlePercent = 10.0;
+        public double BlendSpeedWeight = 0.6;
+        public bool StopOnZeroSpeed = false;
+        public double DepthCurve = 1.60; // Stronger low-depth contrast; full depth still maps to 100%.
+        public double HybridDepthGate = 0.65; // Reduce speed contribution at shallow insertion.
+        public double SmoothSeconds = 0.12;
+        public double StopFadeSeconds = 0.08;
+        public double FallSeconds = 0.12;
+        public double DepthSmoothSeconds = 0.20; // Smooth depth response with quicker tracking.
+        public MotorSetting(string name, int deviceIndex, int featureIndex)
+        { Name = name; DeviceIndex = deviceIndex; FeatureIndex = featureIndex; }
+    }
+
+    // A motor's selected source is evaluated only after all existing output safety checks.
+    // Hybrid: 60% speed + 40% depth, with movement gating so stationary output fades to zero.
+    // Idle is optional and only applies when insertion is valid and nonzero.
+    static double SelectedMotorPercent(MotorSetting m)
+    {
+        double speedPercent = Math.Clamp(movementTarget, 0, 100);
+        // Shower has no validated depth calibration. Use speed as a
+        // shower-only fallback for depth-dependent motor modes.
+        if (movementController == "Live2DShowerController" &&
+            (m.Source == "hybrid" || m.Source == "blend" || m.Source == "depth"))
+            // A steeper curve emphasizes acceleration and deceleration without
+            // increasing the configured maximum output.
+            return movementSpeed < ZeroSpeedThreshold ? 0 :
+                100.0 * Math.Pow(speedPercent / 100.0, 1.8);
+        // Blowjob-only speed response: 1.5x speed sensitivity, capped at 100%.
+        // This affects speed, hybrid, and blend modes; depth-only remains depth-driven.
+        if (movementController == "Live2DBlowjobController")
+            speedPercent = Math.Clamp(speedPercent * 1.5, 0, 100);
+        double depthFraction = normalizedDepthValid
+            ? Math.Pow(Math.Clamp(normalizedDepth / 100.0, 0, 1), m.DepthCurve) : 0;
+        double depthPercent = 100.0 * depthFraction;
+        bool withdrawn = !normalizedDepthValid || normalizedDepth <= 1.0;
+        if ((m.Source == "depth" || m.Source == "hybrid" || m.Source == "blend") && withdrawn) return 0;
+        if (m.Source == "hybrid")
+        {
+            // Speed cutoff avoids a residual target holding the motor on.
+            double speedFraction = movementSpeed < ZeroSpeedThreshold ? 0 : speedPercent / 100.0;
+            double depthGate = Math.Pow(Math.Clamp(normalizedDepth / 100.0, 0, 1), m.HybridDepthGate);
+            double active = speedFraction > 0
+                ? speedPercent * m.BlendSpeedWeight * depthGate + depthPercent * (1.0 - m.BlendSpeedWeight)
+                : 0;
+            return active > 0 ? active : (m.IdleEnabled ? m.IdlePercent * depthFraction : 0);
+        }
+        if ((m.Source == "speed" || m.StopOnZeroSpeed) && movementSpeed < ZeroSpeedThreshold) return 0;
+        return m.Source switch
+        {
+            "depth" => movementSpeed < ZeroSpeedThreshold ? (m.IdleEnabled ? m.IdlePercent * depthFraction : 0) : depthPercent,
+            "blend" => speedPercent * m.BlendSpeedWeight * Math.Pow(Math.Clamp(normalizedDepth / 100.0, 0, 1), m.HybridDepthGate) + depthPercent * (1 - m.BlendSpeedWeight),
+            _ => speedPercent
+        };
+    }
+
+    static void PrintMotors()
+    {
+        lock (SimulationLock)
+        {
+            Console.WriteLine("[MOTOR CONFIG] Physical armed: " + physicalArmed);
+            Console.WriteLine("Emergency stop: " + emergencyStopped);
+            for (int i = 0; i < Motors.Count; i++)
+            {
+                var m = Motors[i];
+                double output = emergencyStopped || !m.Enabled ? 0 :
+                    Math.Min(m.MaxPercent, SelectedMotorPercent(m) *
+                        (movementController == "Live2DBlowjobController" && m.Source != "depth" ? 1.8 : 1.0) * m.Multiplier);
+                Console.WriteLine($"  {i + 1}: {m.Name} (device {m.DeviceIndex}, feature {m.FeatureIndex}) " +
+                    $"enabled={m.Enabled} multiplier={m.Multiplier:F2} cap={m.MaxPercent:F0}% " +
+                    $"source={m.Source} blendSpeed={m.BlendSpeedWeight:F2} zeroCutoff={m.StopOnZeroSpeed} curve={m.DepthCurve:F2} depthgate={m.HybridDepthGate:F2} smooth={m.SmoothSeconds:F2}s fall={m.FallSeconds:F2}s stopfade={m.StopFadeSeconds:F2}s threshold={ZeroSpeedThreshold:F3} depthSmooth={m.DepthSmoothSeconds:F2}s idle={(m.IdleEnabled ? "on" : "off")} idleLevel={m.IdlePercent:F0}% ejac={m.EjacMode} ejacIntensity={m.EjacIntensity:F0}% ejacPulse={m.EjacPulse:F2}s ejacFade={m.EjacFade:F2}s " +
+                    $"virtual={output:F1}%");
+            }
+        }
+    }
+
+    static bool ConfigureMotor(string command)
+    {
+        string[] p = command.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (p.Length == 0 || !p[0].Equals("motor", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (p.Length != 4 || !int.TryParse(p[1], out int number) || number < 1 || number > Motors.Count)
+        {
+            Console.WriteLine("Usage: motor <channel-number> <cap|gain|on|source|blend|cutoff|curve|depthgate|smooth|depthsmooth|fall|stopfade|threshold|idle|idlelevel|ejaculate|ejacintensity|ejacpulse|ejacfade> <value>");
+            return true;
+        }
+        var m = Motors[number - 1];
+        lock (SimulationLock)
+        {
+            if (p[2].Equals("ejaculate", StringComparison.OrdinalIgnoreCase) &&
+                (p[3].Equals("off", StringComparison.OrdinalIgnoreCase) ||
+                 p[3].Equals("override", StringComparison.OrdinalIgnoreCase) ||
+                 p[3].Equals("additive", StringComparison.OrdinalIgnoreCase) ||
+                 p[3].Equals("shot-override", StringComparison.OrdinalIgnoreCase) ||
+                 p[3].Equals("shot-additive", StringComparison.OrdinalIgnoreCase)))
+                m.EjacMode = p[3].ToLowerInvariant();
+            else if (p[2].Equals("source", StringComparison.OrdinalIgnoreCase) &&
+                (p[3].Equals("speed", StringComparison.OrdinalIgnoreCase) ||
+                 p[3].Equals("depth", StringComparison.OrdinalIgnoreCase) ||
+                 p[3].Equals("blend", StringComparison.OrdinalIgnoreCase) ||
+                 p[3].Equals("hybrid", StringComparison.OrdinalIgnoreCase)))
+                m.Source = p[3].ToLowerInvariant();
+            else if (p[2].Equals("idle", StringComparison.OrdinalIgnoreCase) &&
+                (p[3] == "0" || p[3] == "1" || p[3].Equals("on", StringComparison.OrdinalIgnoreCase) || p[3].Equals("off", StringComparison.OrdinalIgnoreCase)))
+                m.IdleEnabled = p[3] == "1" || p[3].Equals("on", StringComparison.OrdinalIgnoreCase);
+            else if (p[2].Equals("cutoff", StringComparison.OrdinalIgnoreCase) &&
+                (p[3] == "0" || p[3] == "1"))
+                m.StopOnZeroSpeed = p[3] == "1";
+            else if (p[2].Equals("on", StringComparison.OrdinalIgnoreCase) &&
+                (p[3] == "0" || p[3] == "1"))
+                m.Enabled = p[3] == "1";
+            else if (double.TryParse(p[3], NumberStyles.Float, CultureInfo.InvariantCulture, out double value) &&
+                     !double.IsNaN(value) && !double.IsInfinity(value))
+            {
+                if (p[2].Equals("ejacintensity", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 100)
+                    m.EjacIntensity = value;
+                else if (p[2].Equals("ejacpulse", StringComparison.OrdinalIgnoreCase) && value >= 0.05 && value <= 5)
+                    m.EjacPulse = value;
+                else if (p[2].Equals("ejacfade", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 5)
+                    m.EjacFade = value;
+                else if (p[2].Equals("idlelevel", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 100)
+                    m.IdlePercent = value;
+                else if (p[2].Equals("cap", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 100)
+                    m.MaxPercent = value;
+                else if (p[2].Equals("gain", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 2)
+                    m.Multiplier = value;
+                else if (p[2].Equals("blend", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 1)
+                    m.BlendSpeedWeight = value;
+                else if (p[2].Equals("curve", StringComparison.OrdinalIgnoreCase) && value >= 0.5 && value <= 4)
+                    m.DepthCurve = value;
+                else if (p[2].Equals("depthgate", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 3)
+                    m.HybridDepthGate = value;
+                else if (p[2].Equals("smooth", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 2)
+                    m.SmoothSeconds = value;
+                else if (p[2].Equals("depthsmooth", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 2)
+                    m.DepthSmoothSeconds = value;
+                else if (p[2].Equals("fall", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 2)
+                    m.FallSeconds = value;
+                else if (p[2].Equals("stopfade", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 2)
+                    m.StopFadeSeconds = value;
+                else if (p[2].Equals("threshold", StringComparison.OrdinalIgnoreCase) && value >= 0 && value <= 1)
+                    ZeroSpeedThreshold = value;
+                else
+                    Console.WriteLine("Invalid setting: cap 0-100, gain 0-2, blend 0-1, curve 0.5-4, depthgate 0-3, smooth/depthsmooth/fall/stopfade 0-2, threshold 0-1, on/cutoff 0/1.");
+            }
+            else Console.WriteLine("Invalid value.");
+        }
+        PrintMotors();
+        return true;
+    }
+
+    // v3.7.14: The TCP bridge is always available; Intiface connects only on request.
+    private static readonly SemaphoreSlim SessionGate = new(1, 1);
+    private static ClientWebSocket? activeSocket;
+    private static CancellationTokenSource? sessionCancellation;
+    private static Task? sessionTask;
+    private static string connectionState = "DISCONNECTED";
+    private static string connectionError = "";
+    private static string IntifaceUrl => Environment.GetEnvironmentVariable("MDRG_INTIFACE_URL")
+        ?? "ws://127.0.0.1:12345";
+
+    static string ConnectionReply()
+    {
+        string state = connectionState;
+        string error = connectionError.Replace('\r', ' ').Replace('\n', ' ').Replace('|', '/');
+        return "INTIFACE_STATUS|" + state + "|" + error;
+    }
+
+    static async Task ConnectIntiface()
+    {
+        await SessionGate.WaitAsync();
+        try
+        {
+            if (connectionState == "CONNECTED" || connectionState == "CONNECTING") return;
+            connectionState = "CONNECTING";
+            connectionError = "";
+            // Previous session has finished or been explicitly disconnected.
+            var socket = new ClientWebSocket();
+            var cts = new CancellationTokenSource();
+            try
+            {
+                Console.WriteLine("[INTIFACE] Connecting on game request to " + IntifaceUrl);
+                using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(7)))
+                    await socket.ConnectAsync(new Uri(IntifaceUrl), timeout.Token);
+                await SendMessage(socket,
+                    "[{\"RequestServerInfo\":{\"Id\":1,\"ClientName\":\"MDRG Bridge\",\"MessageVersion\":3}}]",
+                    cts.Token);
+                using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                {
+                    string response = await ReceiveMessage(socket, timeout.Token);
+                    if (!response.Contains("\"ServerInfo\""))
+                        throw new InvalidOperationException("Intiface rejected the handshake.");
+                }
+                activeSocket = socket;
+                sessionCancellation = cts;
+                // A successfully negotiated Intiface session starts with a healthy output loop.
+                // Keep physical output disarmed until fresh game telemetry and discovered
+                // enabled channels satisfy the existing automatic-arming prerequisites.
+                // Output-loop exceptions and disconnects still mark this unhealthy.
+                lock (SimulationLock) { physicalArmed = false; outputLoopHealthy = true; emergencyStopped = false; autoArmBlocked = false; }
+                lock (DeviceLock) { Devices.Clear(); Motors.Clear(); LinearAxes.Clear(); websiteIntensityByDevice.Clear(); }
+                connectionState = "CONNECTED";
+                Console.WriteLine("[INTIFACE] Connected on player request.");
+                await SendMessage(socket, "[{\"RequestDeviceList\":{\"Id\":2}}]", cts.Token);
+                sessionTask = RunIntifaceSession(socket, cts);
+            }
+            catch (Exception ex)
+            {
+                connectionState = "FAILED";
+                connectionError = ex.Message;
+                Console.WriteLine("[INTIFACE] Connection failed: " + ex.Message);
+                socket.Dispose();
+                cts.Dispose();
+                activeSocket = null;
+                sessionCancellation = null;
+            }
+        }
+        finally { SessionGate.Release(); }
+    }
+
+    static async Task RunIntifaceSession(ClientWebSocket socket, CancellationTokenSource cts)
+    {
+        try
+        {
+            Task monitor = MonitorIntiface(socket, cts.Token);
+            Task output = RunPhysicalOutput(socket, cts.Token);
+            await monitor;
+            cts.Cancel();
+            try { await output; } catch (OperationCanceledException) { }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Console.WriteLine("[INTIFACE] Session error: " + ex.Message); }
+        finally
+        {
+            await SessionGate.WaitAsync();
+            try
+            {
+                if (ReferenceEquals(activeSocket, socket))
+                {
+                    activeSocket = null;
+                    sessionCancellation = null;
+                    connectionState = "DISCONNECTED";
+                    connectionError = "Intiface connection closed.";
+                    lock (SimulationLock) { physicalArmed = false; outputLoopHealthy = false; }
+                    lock (DeviceLock) { Devices.Clear(); Motors.Clear(); LinearAxes.Clear(); websiteIntensityByDevice.Clear(); }
+                }
+            }
+            finally { SessionGate.Release(); }
+            socket.Dispose();
+            cts.Dispose();
+        }
+    }
+
+    static async Task DisconnectIntiface()
+    {
+        await SessionGate.WaitAsync();
+        try
+        {
+            if (activeSocket is { State: WebSocketState.Open } socket)
+            {
+                // Zero output before closing; prevent automatic rearming.
+                lock (SimulationLock)
+                {
+                    physicalArmed = false;
+                    emergencyStopped = true;
+                    autoArmBlocked = true;
+                    currentIntensity = 0;
+                    targetIntensity = 0;
+                }
+                try { await SendAllZero(socket, CancellationToken.None); }
+                catch (Exception ex) { Console.WriteLine("[INTIFACE] Zero command failed: " + ex.Message); }
+            }
+            sessionCancellation?.Cancel();
+            activeSocket?.Abort();
+            activeSocket = null;
+            sessionCancellation = null;
+            connectionState = "DISCONNECTED";
+            connectionError = "";
+            lock (DeviceLock) { Devices.Clear(); Motors.Clear(); LinearAxes.Clear(); websiteIntensityByDevice.Clear(); }
+            Console.WriteLine("[INTIFACE] Disconnected on player request.");
+        }
+        finally { SessionGate.Release(); }
+    }
+
+    static async Task Main()
+    {
+        StartMovementLog();
+        using var cancellation = new CancellationTokenSource();
+        var listener = new TcpListener(IPAddress.Loopback, 45678);
+        Console.WriteLine("MDRG Bridge v3.7.14 - Manual Intiface connection");
+        Console.WriteLine("[INTIFACE] Waiting for the in-game Connect button.");
+        try
+        {
+            listener.Start();
+            Console.WriteLine("[BRIDGE] Listening on 127.0.0.1:45678");
+            PrintHelp();
+            Task gameListener = ListenForGame(listener, cancellation.Token);
+            Task simulation = RunSimulation(cancellation.Token);
+            await ReadCommands(cancellation);
+            await DisconnectIntiface();
+            cancellation.Cancel();
+            listener.Stop();
+            try { await Task.WhenAll(gameListener, simulation); }
+            catch (OperationCanceledException) { }
+            catch (SocketException) when (cancellation.IsCancellationRequested) { }
+        }
+        catch (Exception ex) { Console.WriteLine("[ERROR] " + ex.Message); }
+        finally
+        {
+            cancellation.Cancel();
+            listener.Stop();
+            lock (LogLock) { movementLog?.Dispose(); movementLog = null; }
+            Console.WriteLine("[BRIDGE] Stopped.");
+        }
+    }
+
+    static void PrintHelp()
+    {
+        Console.WriteLine();
+        Console.WriteLine("Commands:");
+        Console.WriteLine("  connect      Connect to already-running Intiface Central");
+        Console.WriteLine("  disconnect   Disconnect from Intiface Central");
+        Console.WriteLine("  list         Show connected devices");
+        Console.WriteLine("  status       Show simulation status");
+        Console.WriteLine("  depthstats   Show observed depth ranges by controller and handler");
+        Console.WriteLine("  depthreset   Clear depth diagnostic history only");
+        Console.WriteLine("  logpath      Show the automatic movement log location");
+        Console.WriteLine("  armstatus    Explain arming prerequisites");
+        Console.WriteLine("  level 50     Set virtual target to 50%");
+        Console.WriteLine("  speed 40     Change transition speed");
+        Console.WriteLine("  timeout 15   Change heartbeat timeout");
+        Console.WriteLine("  reset        Reset virtual intensity");
+        Console.WriteLine("  (Game movement overrides manual level commands.)");
+        Console.WriteLine("  help         Show commands");
+        Console.WriteLine("  motors       Show detected vibration channels");
+        Console.WriteLine("  linears      Show discovered linear actuators (disabled by default)");
+        Console.WriteLine("  linear 1 on|off  Enable/disable a linear axis (on by default)");
+        Console.WriteLine("  linear 1 min 20   Minimum travel position percent");
+        Console.WriteLine("  linear 1 max 80   Maximum travel position percent");
+        Console.WriteLine("  linear 1 reverse on|off  Reverse depth direction");
+        Console.WriteLine("  linear 1 duration 100  Move duration milliseconds (50-2000)");
+        Console.WriteLine("  linear 1 wavesmooth 0.10  Position smoothing in seconds (0-1)");
+        Console.WriteLine("  motor 1 ejaculate off|override|additive|shot-override|shot-additive  Event response");
+        Console.WriteLine("  motor 1 ejacintensity 60  Event response percent (0-100, respects cap)");
+        Console.WriteLine("  motor 1 ejacpulse 0.20  Pulse duration for shot modes, cycle for legacy modes (0.05-5)");
+        Console.WriteLine("  motor 1 ejacfade 0.15  Fade after event ends in seconds (0-5)");
+        Console.WriteLine("  motor 1 source speed|depth|blend|hybrid   Select channel input");
+        Console.WriteLine("  motor 1 blend 0.5   Blend speed weight (0=depth, 1=speed)");
+        Console.WriteLine("  motor 1 curve 1.6     Depth curve (>1 gives lower shallow output; max stays 100%)");
+        Console.WriteLine("  motor 1 depthgate 0.65   Reduce hybrid speed strength at shallow depth (0=off)");
+        Console.WriteLine("  motor 1 idle on|off   Toggle depth-scaled idle vibration when stationary");
+        Console.WriteLine("  motor 1 idlelevel 10  Idle intensity at full depth (0-100%)");
+        Console.WriteLine("  motor 1 smooth 0.12      Speed/hybrid/blend smoothing (seconds)");
+        Console.WriteLine("  motor 1 depthsmooth 0.38  Depth-only wave smoothing (seconds)");
+        Console.WriteLine("  motor 1 fall 0.12         Normal fall smoothing (seconds)");
+        Console.WriteLine("  motor 1 stopfade 0.08     Fade time when movement stops (seconds)");
+        Console.WriteLine("  motor 1 threshold 0.05   Speed cutoff for stopped movement (0-1)");
+        Console.WriteLine("  motor 1 blend 0.60       Hybrid speed weight (depth gets remaining 0.40)");
+        Console.WriteLine("  motor 1 cutoff 0   Keep depth output active when movement speed is zero");
+        Console.WriteLine("  Devices and their vibration channels are discovered from Intiface.");
+        Console.WriteLine("  motor 1 cap 100  Set channel maximum to 100% (adjustable 0-100%)");
+        Console.WriteLine("  motor 2 gain 0.5 Set channel multiplier to 0.5");
+        Console.WriteLine("  motor 3 on 0    Disable channel 3");
+        Console.WriteLine("  stop         Latch all virtual outputs at zero");
+        Console.WriteLine("  resume       Clear stop latch and allow automatic arming");
+        Console.WriteLine("  arm          Manually arm detected channels (optional)");
+        Console.WriteLine("  disarm       Send zero and block automatic rearming until resume");
+        Console.WriteLine("  stop         Emergency zero and latch output off");
+        Console.WriteLine("  quit         Stop bridge");
+        Console.WriteLine();
+    }
+
+    static async Task ReadCommands(
+        CancellationTokenSource cancellation)
+    {
+        while (!cancellation.IsCancellationRequested)
+        {
+            string? command =
+                await Task.Run(() => Console.ReadLine());
+
+            if (command == null)
+                break;
+
+            command = command.Trim();
+
+            if (command.Equals(
+                "quit", StringComparison.OrdinalIgnoreCase))
+                break;
+
+            if (command.Equals(
+                "help", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintHelp();
+                continue;
+            }
+
+            if (command.Equals("connect", StringComparison.OrdinalIgnoreCase))
+            { await ConnectIntiface(); Console.WriteLine(ConnectionReply()); continue; }
+            if (command.Equals("disconnect", StringComparison.OrdinalIgnoreCase))
+            { await DisconnectIntiface(); Console.WriteLine(ConnectionReply()); continue; }
+
+            if (command.Equals(
+                "list", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintDevices();
+                continue;
+            }
+
+            if (command.Equals(
+                "status", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintStatus();
+                continue;
+            }
+
+            if (command.Equals("logpath", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("[LOG] " + (movementLog == null ? "Unavailable" : movementLogPath));
+                continue;
+            }
+            if (command.Equals("armstatus", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintArmingDiagnostics();
+                continue;
+            }
+            if (command.Equals("depthstats", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintDepthStats();
+                continue;
+            }
+            if (command.Equals("depthreset", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (SimulationLock)
+                {
+                    DepthByController.Clear();
+                    DepthByHandler.Clear();
+                }
+                Console.WriteLine("[DEPTH] Diagnostic history cleared; physical output unchanged.");
+                continue;
+            }
+            if (command.Equals("motors", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintMotors();
+                continue;
+            }
+            if (command.Equals("linears", StringComparison.OrdinalIgnoreCase))
+            { PrintLinears(); continue; }
+            if (ConfigureLinear(command)) continue;
+            if (ConfigureMotor(command)) continue;
+            if (command.Equals("stop", StringComparison.OrdinalIgnoreCase) ||
+                command.Equals("disarm", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (SimulationLock)
+                {
+                    physicalArmed = false;
+                    emergencyStopped = true;
+                    autoArmBlocked = true;
+                    pauseStarted = DateTime.MinValue;
+                    currentIntensity = 0;
+                    targetIntensity = 0;
+                }
+                if (activeSocket is { State: WebSocketState.Open } liveSocket)
+                    await SendGushZero(liveSocket, cancellation.Token);
+                Console.WriteLine("[STOP] All detected vibration channels zeroed; output DISARMED.");
+                continue;
+            }
+            if (command.Equals("arm", StringComparison.OrdinalIgnoreCase) || command.Equals("arm gush", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (SimulationLock)
+                {
+                    bool fresh = receivingMovement && gameActive &&
+                        (DateTime.UtcNow-lastIntensityUpdate).TotalSeconds < 1 &&
+                        (DateTime.UtcNow-lastGameHeartbeat).TotalSeconds < HeartbeatDisconnectSeconds;
+                    if (fresh && !emergencyStopped && !autoArmBlocked && outputLoopHealthy && (Motors.Exists(m => m.Enabled) || LinearAxes.Exists(a => a.Enabled)))
+                    { physicalArmed = true; Console.WriteLine("[ARMED] Detected vibration channels enabled."); }
+                    else Console.WriteLine("[ARM DENIED] Need fresh game telemetry, an enabled channel, and no stop latch. Try resume.");
+                }
+                continue;
+            }
+            if (command.Equals("resume", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (SimulationLock) { emergencyStopped = false; autoArmBlocked = false; }
+                Console.WriteLine("[RESUME] Stop latch cleared. Automatic arming enabled.");
+                TryAutoArmGush();
+                continue;
+            }
+            if (command.Equals(
+                "reset", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (SimulationLock)
+                {
+                    currentIntensity = 0;
+                    targetIntensity = 0;
+                    gameActive = false;
+                    receivingMovement = false;
+                    lastIntensityUpdate = DateTime.MinValue;
+                }
+
+                Console.WriteLine("[SIMULATION] Reset to 0%.");
+                continue;
+            }
+
+            if (TryReadNumber(command, "level", out double level))
+            {
+                if (level < 0 || level > 100)
+                {
+                    Console.WriteLine(
+                        "Level must be between 0 and 100.");
+                    continue;
+                }
+
+                lock (SimulationLock)
+                    targetIntensity = level;
+
+                Console.WriteLine(
+                    "[SIMULATION] Target: " + level + "%");
+                continue;
+            }
+
+            if (TryReadNumber(command, "speed", out double speed))
+            {
+                if (speed <= 0 || speed > 1000)
+                {
+                    Console.WriteLine(
+                        "Speed must be greater than 0 and at most 1000.");
+                    continue;
+                }
+
+                lock (SimulationLock)
+                    transitionSpeed = speed;
+
+                Console.WriteLine(
+                    "[SIMULATION] Speed: " +
+                    speed + "% per second");
+                continue;
+            }
+
+            if (TryReadNumber(
+                command, "timeout", out double timeout))
+            {
+                if (timeout < 1 || timeout > 3600)
+                {
+                    Console.WriteLine(
+                        "Timeout must be between 1 and 3600 seconds.");
+                    continue;
+                }
+
+                lock (SimulationLock)
+                    inactivityTimeout = timeout;
+
+                Console.WriteLine(
+                    "[SIMULATION] Timeout: " +
+                    timeout + " seconds");
+                continue;
+            }
+
+            Console.WriteLine("Unknown command. Type help.");
+        }
+    }
+
+    static bool TryReadNumber(
+        string command,
+        string prefix,
+        out double value)
+    {
+        value = 0;
+
+        if (!command.StartsWith(
+            prefix + " ",
+            StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return double.TryParse(
+            command.Substring(prefix.Length + 1).Trim(),
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out value) &&
+            !double.IsNaN(value) &&
+            !double.IsInfinity(value);
+    }
+
+    static async Task RunSimulation(CancellationToken token)
+    {
+        DateTime previous = DateTime.UtcNow;
+        int previousDisplayedLevel = -1;
+        DateTime previousVirtualConsole = DateTime.MinValue;
+
+        while (!token.IsCancellationRequested)
+        {
+            await Task.Delay(250, token);
+
+            DateTime now = DateTime.UtcNow;
+            double elapsed = (now - previous).TotalSeconds;
+            previous = now;
+
+            int displayLevel;
+            double target;
+            bool timedOut = false;
+
+            lock (SimulationLock)
+            {
+                if (gameActive &&
+                    (now - lastGameHeartbeat).TotalSeconds >=
+                    inactivityTimeout)
+                {
+                    gameActive = false;
+                    targetIntensity = 0;
+                    timedOut = true;
+                    physicalArmed = false;
+                    // Connection timeouts are not manual emergency stops.
+                    // Auto-arming is allowed again after fresh telemetry returns.
+                }
+
+                // Fail safe: never hold the last nonzero game intensity
+                // when the game stops sending movement samples.
+                if (receivingMovement &&
+                    (now - lastIntensityUpdate).TotalSeconds > 2.0)
+                {
+                    receivingMovement = false;
+                    targetIntensity = 0;
+                    currentIntensity = 0;
+                    timedOut = true;
+                    // A short scene transition pauses physical output without disarming.
+                    // The physical output loop disarms if telemetry stays absent.
+                }
+
+                double maxChange = transitionSpeed * elapsed;
+
+                if (receivingMovement)
+                {
+                    // The mod has already smoothed this value.
+                    // Do not smooth it a second time in the bridge.
+                    currentIntensity = targetIntensity;
+                }
+                else if (currentIntensity < targetIntensity)
+                {
+                    currentIntensity = Math.Min(
+                        currentIntensity + maxChange,
+                        targetIntensity);
+                }
+                else if (currentIntensity > targetIntensity)
+                {
+                    currentIntensity = Math.Max(
+                        currentIntensity - maxChange,
+                        targetIntensity);
+                }
+
+                currentIntensity =
+                    Math.Clamp(currentIntensity, 0, 100);
+
+                displayLevel =
+                    (int)Math.Round(currentIntensity);
+
+                target = targetIntensity;
+            }
+
+            if (timedOut)
+            {
+                Console.WriteLine(
+                    "[TIMEOUT] Game heartbeat lost.");
+                Console.WriteLine(
+                    "[SIMULATION] Returning to 0%.");
+            }
+
+            if (displayLevel != previousDisplayedLevel &&
+                (DateTime.UtcNow - previousVirtualConsole).TotalSeconds >= 2)
+            {
+                previousVirtualConsole = DateTime.UtcNow;
+                previousDisplayedLevel = displayLevel;
+
+                Console.WriteLine(
+                    "[VIRTUAL] " + MakeBar(displayLevel) + " " + displayLevel +
+                    "% (target " + target.ToString("F1", CultureInfo.InvariantCulture) + "%)");
+                PrintMotors();
+            }
+        }
+    }
+
+    // Each channel is independently mapped to an Intiface device/actuator index.
+    // Only advertised Vibrate scalar actuators are supported; other actuator types
+    // (Rotate, Linear, etc.) require type-specific commands and are not guessed.
+    static async Task RunPhysicalOutput(ClientWebSocket socket, CancellationToken token)
+    {
+        var filtered = new Dictionary<string, double>();
+        DateTime lastTick = DateTime.UtcNow;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                await Task.Delay(20, token);
+                DateTime now = DateTime.UtcNow;
+                double dt = Math.Clamp((now-lastTick).TotalSeconds, 0, 0.5);
+                lastTick = now;
+                List<(int device, int feature, double scalar)> outputs = new();
+                bool lostHeartbeat = false;
+                lock (SimulationLock)
+                {
+                    bool heartbeatFresh = gameActive && lastGameHeartbeat != DateTime.MinValue &&
+                        (now-lastGameHeartbeat).TotalSeconds < HeartbeatDisconnectSeconds;
+                    bool fresh = receivingMovement && heartbeatFresh &&
+                        (now-lastIntensityUpdate).TotalSeconds < 1.0;
+                    if (!heartbeatFresh && physicalArmed)
+                    { physicalArmed = false; lostHeartbeat = true; }
+                    bool active = physicalArmed && !emergencyStopped && !autoArmBlocked &&
+                        outputLoopHealthy && fresh && movementHandler >= 0;
+                    foreach (var m in Motors)
+                    {
+                        string key = $"{m.DeviceIndex}:{m.FeatureIndex}";
+                        double old = filtered.TryGetValue(key, out var prev) ? prev : 0;
+                        double desired = 0;
+                        if (active && m.Enabled)
+                        {
+                            bool depthOnly = m.Source == "depth";
+                            double sensitivity = movementController == "Live2DBlowjobController" && !depthOnly ? 1.8 : 1.0;
+                            desired = Math.Clamp(SelectedMotorPercent(m)*sensitivity*m.Multiplier*(websiteIntensityByDevice.TryGetValue(m.DeviceIndex, out var deviceIntensity) ? deviceIntensity : 1.0), 0, m.MaxPercent)/100;
+                            // Events never bypass arming, heartbeat, emergency stop or per-motor enable.
+                            if (m.EjacMode != "off")
+                            {
+                                bool shotMode = m.EjacMode == "shot-override" || m.EjacMode == "shot-additive";
+                                double eventEnvelope = shotMode ? ShotEnvelope(now, m.EjacPulse) :
+                                    EjaculationEnvelope(now, m.EjacFade, out _);
+                                if (eventEnvelope > 0)
+                                {
+                                    double wave = 1.0;
+                                    if (!shotMode)
+                                    {
+                                        EjaculationEnvelope(now, m.EjacFade, out double elapsed);
+                                        double period = Math.Max(0.05, m.EjacPulse);
+                                        wave = 0.625 + 0.375 * Math.Sin(2 * Math.PI * elapsed / period);
+                                    }
+                                    double eventValue = Math.Clamp(m.EjacIntensity * eventEnvelope * wave / 100.0, 0, m.MaxPercent / 100.0);
+                                    desired = (m.EjacMode == "override" || m.EjacMode == "shot-override") ? eventValue :
+                                        Math.Min(m.MaxPercent / 100.0, desired + eventValue);
+                                }
+                                else if (m.EjacMode == "shot-override" && IsClimaxActive(now, movementController))
+                                {
+                                    // During climax, the individual shots take priority.
+                                    // Outside climax, preserve normal movement vibration.
+                                    desired = 0;
+                                }
+                            }
+                        }
+                        // Only bypass the depth-withdrawal gate for shower speed fallback.
+                        bool showerSpeedFallback = movementController == "Live2DShowerController";
+                        bool withdrawn = !showerSpeedFallback &&
+                            (m.Source == "depth" || m.Source == "hybrid" || m.Source == "blend") &&
+                            (!normalizedDepthValid || normalizedDepth <= 1.0);
+                        bool eventActive = m.EjacMode != "off" &&
+                            (m.EjacMode.StartsWith("shot-", StringComparison.Ordinal) ?
+                                ShotEnvelope(now, m.EjacPulse) > 0 :
+                                EjaculationEnvelope(now, m.EjacFade, out _) > 0);
+                        if (!active || !m.Enabled || (withdrawn && !eventActive)) old = 0;
+                        else
+                        {
+                            double rise = m.Source == "depth" ? m.DepthSmoothSeconds : m.SmoothSeconds;
+                            double fall = normalizedDepthValid && normalizedDepth < 9 ? 0.02 :
+                                movementSpeed < ZeroSpeedThreshold && !m.IdleEnabled ? m.StopFadeSeconds : m.FallSeconds;
+                            // Track shower speed changes more closely, without changing other scenes.
+                            if (showerSpeedFallback && !eventActive)
+                            {
+                                rise = Math.Min(rise, 0.055);
+                                fall = Math.Min(fall, 0.045);
+                            }
+                            double tau = eventActive ? 0.04 : desired > old ? rise : fall;
+                            double alpha = tau <= 0 ? 1 : 1-Math.Exp(-dt/tau);
+                            old += (desired-old)*alpha;
+                            if (old < 0.0005 && desired == 0) old = 0;
+                        }
+                        filtered[key] = old;
+                        outputs.Add((m.DeviceIndex, m.FeatureIndex, old));
+                    }
+                }
+                if (lostHeartbeat) Console.WriteLine("[OUTPUT] Game heartbeat lost; outputs zero and disarmed.");
+                await SendScalars(socket, outputs, token);
+                // Linear commands follow absolute depth, never speed-as-position.
+                // Do not issue new movement commands if heartbeat expires, stopped or disarmed.
+                List<(int device,int axis,int duration,double position)> linearMoves = new();
+                lock (SimulationLock)
+                {
+                    bool fresh = physicalArmed && !emergencyStopped && !autoArmBlocked &&
+                        receivingMovement && gameActive && normalizedDepthValid && movementHandler >= 0 &&
+                        (now-lastGameHeartbeat).TotalSeconds < HeartbeatDisconnectSeconds &&
+                        (now-lastIntensityUpdate).TotalSeconds < 1.0;
+                    if (!fresh) foreach(var a in LinearAxes) a.LastPosition=double.NaN;
+                    if (fresh)
+                    foreach(var a in LinearAxes)
+                    {
+                        if (!a.Enabled) continue;
+                        double depth=Math.Clamp(normalizedDepth/100,0,1);
+                        if (a.Reverse) depth=1-depth;
+                        double target=a.Min+(a.Max-a.Min)*depth;
+                        // Follow game depth continuously with a tunable low-pass filter.
+                        // Repeated small position steps avoid the sharp rectangular plateaus
+                        // caused by directly jumping to each 20Hz telemetry sample.
+                        double previous=double.IsNaN(a.LastPosition) ? target : a.LastPosition;
+                        double alpha=a.WaveSmoothSeconds<=0 ? 1 :
+                            1-Math.Exp(-Math.Max(dt,0.001)/a.WaveSmoothSeconds);
+                        double position=previous+(target-previous)*alpha;
+                        if (Math.Abs(target-position)<0.0005) position=target;
+                        if (double.IsNaN(a.LastPosition) || Math.Abs(position-a.LastPosition)>=0.0005)
+                        {
+                            linearMoves.Add((a.DeviceIndex,a.FeatureIndex,a.DurationMs,position));
+                            a.LastPosition=position;
+                        }
+                    }
+                }
+                await SendLinears(socket,linearMoves,token);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            lock (SimulationLock) { physicalArmed=false; emergencyStopped=true; autoArmBlocked=true; outputLoopHealthy=false; }
+            Console.WriteLine("[OUTPUT ERROR] Disarmed: " + ex.Message);
+        }
+    }
+
+    static Task SendGushZero(ClientWebSocket socket, CancellationToken token) => SendAllZero(socket, token);
+    static Task SendAllZero(ClientWebSocket socket, CancellationToken token)
+    {
+        List<(int device, int feature, double scalar)> channels;
+        lock (SimulationLock)
+            channels = Motors.Select(m => (m.DeviceIndex, m.FeatureIndex, 0.0)).ToList();
+        return SendScalars(socket, channels, token);
+    }
+
+    static async Task SendScalars(ClientWebSocket socket, List<(int device, int feature, double scalar)> channels, CancellationToken token)
+    {
+        if (socket.State != WebSocketState.Open || channels.Count == 0) return;
+        await SendLock.WaitAsync(token);
+        try
+        {
+            foreach (var group in channels.GroupBy(c => c.device))
+            {
+                var message = new { ScalarCmd = new {
+                    Id = Interlocked.Increment(ref commandId), DeviceIndex = group.Key,
+                    Scalars = group.Select(c => new { Index=c.feature, Scalar=Math.Clamp(c.scalar,0,1), ActuatorType="Vibrate" }).ToArray()
+                }};
+                await SendMessage(socket, JsonSerializer.Serialize(new[] { message }), token);
+            }
+        }
+        finally { SendLock.Release(); }
+    }
+
+    static async Task SendLinears(ClientWebSocket socket,List<(int device,int axis,int duration,double position)> moves,CancellationToken token)
+    {
+        if (socket.State!=WebSocketState.Open || moves.Count==0) return;
+        await SendLock.WaitAsync(token);
+        try
+        {
+            foreach(var group in moves.GroupBy(m=>m.device))
+            {
+                var message=new { LinearCmd=new {
+                    Id=Interlocked.Increment(ref commandId),DeviceIndex=group.Key,
+                    Vectors=group.Select(m=>new {Index=m.axis,Duration=m.duration,Position=Math.Clamp(m.position,0,1)}).ToArray()
+                }};
+                await SendMessage(socket,JsonSerializer.Serialize(new[]{message}),token);
+            }
+        }
+        finally { SendLock.Release(); }
+    }
+    static string MakeBar(int level)
+    {
+        int filled = Math.Clamp(level / 5, 0, 20);
+
+        return "[" +
+            new string('#', filled) +
+            new string('-', 20 - filled) +
+            "]";
+    }
+
+    static void TryAutoArmGush()
+    {
+        bool newlyArmed = false;
+        lock (SimulationLock)
+        {
+            bool heartbeatFresh = gameActive && lastGameHeartbeat != DateTime.MinValue &&
+                (DateTime.UtcNow-lastGameHeartbeat).TotalSeconds < HeartbeatDisconnectSeconds;
+            if (heartbeatFresh && !physicalArmed && !emergencyStopped && !autoArmBlocked &&
+                outputLoopHealthy && (Motors.Exists(m => m.Enabled) || LinearAxes.Exists(a => a.Enabled)))
+            { physicalArmed = true; newlyArmed = true; }
+        }
+        if (newlyArmed) Console.WriteLine("[AUTO-ARMED] Detected vibration channels ready. Type stop to disarm.");
+    }
+
+    static void UpdateVirtualVibration(string gameEvent)
+    {
+        if (!gameEvent.StartsWith("ControllerChanged:",
+            StringComparison.Ordinal))
+            return;
+
+        bool enteringInteraction = gameEvent.EndsWith(":Live2DInteractionController", StringComparison.Ordinal);
+        lock (SimulationLock)
+        {
+            currentIntensity = 0;
+            targetIntensity = 0;
+            receivingMovement = false;
+            movementHandler = -1;
+            movementSpeed = 0;
+            onInteractionScreen = enteringInteraction;
+        }
+        Console.WriteLine("[SIMULATION] Controller changed; physical output paused at zero.");
+        LogMovement("[SIMULATION] Controller changed; physical output paused at zero.");
+        TryAutoArmGush();
+    }
+
+    static bool TryProcessIntensity(string line)
+    {
+        if (!line.StartsWith("SIM_INTENSITY|", StringComparison.Ordinal))
+            return false;
+
+        string controller = "";
+        int handler = -1;
+        double speed = double.NaN;
+        double target = double.NaN;
+        double smoothed = double.NaN;
+        bool positionValid = false;
+        double rawPosition = double.NaN;
+
+        foreach (string field in line.Split('|'))
+        {
+            int equals = field.IndexOf('=');
+            if (equals < 0) continue;
+            string key = field.Substring(0, equals);
+            string value = field.Substring(equals + 1);
+            switch (key)
+            {
+                case "Controller": controller = value; break;
+                case "Handler":
+                    int.TryParse(value, NumberStyles.Integer,
+                        CultureInfo.InvariantCulture, out handler);
+                    break;
+                case "Speed":
+                    double.TryParse(value, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out speed);
+                    break;
+                case "Target":
+                    double.TryParse(value, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out target);
+                    break;
+                case "Smoothed":
+                    double.TryParse(value, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out smoothed);
+                    break;
+                case "PositionValid":
+                    positionValid = value == "1";
+                    break;
+                case "RawPosition":
+                    double.TryParse(value, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out rawPosition);
+                    break;
+            }
+        }
+
+        if (double.IsNaN(speed) || double.IsInfinity(speed) ||
+            double.IsNaN(target) || double.IsInfinity(target) ||
+            double.IsNaN(smoothed) || double.IsInfinity(smoothed))
+        {
+            Console.WriteLine("[SIMULATION] Ignored malformed intensity.");
+            return true;
+        }
+
+        // Require the source values to agree with the configured cap.
+        // Handler -1 means no active movement handler.
+        speed = Math.Max(0, speed);
+        target = handler < 0 ? 0 : Math.Clamp(speed / 2.0, 0, 1);
+        smoothed = handler < 0 ? 0 : Math.Clamp(smoothed, 0, 1);
+
+        bool normalizedValid = TryNormalizeDepth(controller, handler,
+            positionValid, rawPosition, out double depthPercent, out string calibrationName);
+        string direction = "N/A";
+        string observedRange = "N/A";
+        lock (SimulationLock)
+        {
+            if (!DepthByController.TryGetValue(controller, out var stats))
+                DepthByController[controller] = stats = new DepthStats();
+            RecordDepth(stats, positionValid, rawPosition);
+            string handlerKey = controller + " / Handler=" + handler;
+            if (!DepthByHandler.TryGetValue(handlerKey, out var handlerStats))
+                DepthByHandler[handlerKey] = handlerStats = new DepthStats();
+            direction = !positionValid || !double.IsFinite(rawPosition) ? "invalid" :
+                !handlerStats.HasPrevious ? "initial" :
+                rawPosition > handlerStats.Previous + 0.0001 ? "up" :
+                rawPosition < handlerStats.Previous - 0.0001 ? "down" : "steady";
+            RecordDepth(handlerStats, positionValid, rawPosition);
+            if (positionValid && double.IsFinite(rawPosition))
+                observedRange = handlerStats.Minimum.ToString("F4", CultureInfo.InvariantCulture) +
+                    ".." + handlerStats.Maximum.ToString("F4", CultureInfo.InvariantCulture);
+            normalizedDepthValid = normalizedValid;
+            normalizedDepth = normalizedValid ? depthPercent : 0;
+            depthCalibration = calibrationName;
+            if (controller == "Live2DInteractionController") onInteractionScreen = true;
+            movementController = controller;
+            movementHandler = handler;
+            movementSpeed = speed;
+            movementTarget = target * 100.0;
+            movementSmoothed = smoothed * 100.0;
+            depthPositionValid = positionValid &&
+                !double.IsNaN(rawPosition) && !double.IsInfinity(rawPosition);
+            depthRawPosition = depthPositionValid ? rawPosition : 0;
+            targetIntensity = movementSmoothed;
+            currentIntensity = movementSmoothed;
+            lastIntensityUpdate = DateTime.UtcNow;
+            lastGameHeartbeat = lastIntensityUpdate;
+            gameActive = true;
+            receivingMovement = true;
+        }
+
+        string movementMessage = "[MOVEMENT] " + controller +
+            " | Handler=" + handler +
+            " | Speed=" + speed.ToString("F4", CultureInfo.InvariantCulture) +
+            " | Target=" + (target * 100).ToString("F1", CultureInfo.InvariantCulture) +
+            "% | Smoothed=" + (smoothed * 100).ToString("F1", CultureInfo.InvariantCulture) +
+            "% | RawDepth=" + (positionValid && !double.IsNaN(rawPosition) && !double.IsInfinity(rawPosition)
+                ? rawPosition.ToString("F4", CultureInfo.InvariantCulture)
+                : "N/A") +
+            " | Depth%=" + (normalizedValid ? depthPercent.ToString("F1", CultureInfo.InvariantCulture) : "N/A") +
+            " | Speed%=" + (smoothed * 100).ToString("F1", CultureInfo.InvariantCulture) +
+            " | Direction=" + direction +
+            " | ObservedRaw=" + observedRange +
+            " | Calibration=" + calibrationName +
+            " | Depth tracked; optional source mapping may drive Gush";
+        LogMovement(movementMessage);
+        bool showMovement = controller != lastMovementConsoleController ||
+            (DateTime.UtcNow - lastMovementConsole).TotalSeconds >= 2;
+        if (showMovement)
+        {
+            Console.WriteLine(movementMessage);
+            lastMovementConsole = DateTime.UtcNow;
+            lastMovementConsoleController = controller;
+        }
+        return true;
+    }
+
+    // Event-only diagnostic stage. No changes to physical output or motor mapping.
+    private static readonly object EjaculationLock = new();
+    private static DateTime? latestShotUtc;
+    private static int latestShotIndex;
+    private static string latestShotController = "";
+    private static DateTime? ejaculationStartedUtc;
+    private static string ejaculationController = "";
+    private static DateTime? ejaculationEndedUtc;
+    private static DateTime? ejaculationLastStartedUtc;
+
+    static bool IsClimaxActive(DateTime now, string controller)
+    {
+        lock (EjaculationLock)
+            return ejaculationStartedUtc.HasValue &&
+                ejaculationController == controller &&
+                (now - ejaculationStartedUtc.Value).TotalSeconds <= 20;
+    }
+
+    static double EjaculationEnvelope(DateTime now, double fadeSeconds, out double elapsed)
+    {
+        lock (EjaculationLock)
+        {
+            elapsed = ejaculationLastStartedUtc.HasValue ?
+                Math.Max(0, (now - ejaculationLastStartedUtc.Value).TotalSeconds) : 0;
+            // Stale start events must not run indefinitely if an END is missed.
+            if (ejaculationStartedUtc.HasValue)
+                return (now - ejaculationStartedUtc.Value).TotalSeconds <= 20 ? 1 : 0;
+            if (ejaculationEndedUtc.HasValue && fadeSeconds > 0)
+                return Math.Clamp(1 - (now - ejaculationEndedUtc.Value).TotalSeconds / fadeSeconds, 0, 1);
+            return 0;
+        }
+    }
+
+    // A finite, per-shot triangle: zero at the beginning and end, peak halfway.
+    // Uses the existing per-motor pulse duration and intensity settings.
+    static double ShotEnvelope(DateTime now, double duration)
+    {
+        lock (EjaculationLock)
+        {
+            if (!latestShotUtc.HasValue) return 0;
+            double elapsed = (now - latestShotUtc.Value).TotalSeconds;
+            double width = Math.Max(0.05, duration);
+            if (elapsed < 0 || elapsed >= width) return 0;
+            double progress = elapsed / width;
+            return progress <= 0.5 ? 2 * progress : 2 * (1 - progress);
+        }
+    }
+
+    static bool TryProcessShot(string line)
+    {
+        if (!line.StartsWith("EJAC_SHOT|", StringComparison.Ordinal)) return false;
+        string controller = "";
+        int shot = 0;
+        foreach (string part in line.Split('|'))
+        {
+            if (part.StartsWith("Controller=", StringComparison.Ordinal)) controller = part.Substring(11);
+            else if (part.StartsWith("Shot=", StringComparison.Ordinal))
+                int.TryParse(part.Substring(5), NumberStyles.None, CultureInfo.InvariantCulture, out shot);
+        }
+        if (controller.Length == 0 || controller.Length > 80 || controller.Contains('|') || shot < 1 || shot > 100)
+        {
+            Console.WriteLine("[SHOT] Ignored malformed event");
+            return true;
+        }
+        lock (EjaculationLock)
+        {
+            // Prevent stale or duplicated shot indices within the same sequence.
+            if (ejaculationStartedUtc.HasValue && ejaculationController == controller &&
+                shot > latestShotIndex)
+            {
+                latestShotUtc = DateTime.UtcNow;
+                latestShotIndex = shot;
+                latestShotController = controller;
+            }
+            else
+            {
+                Console.WriteLine("[SHOT] Ignored out-of-sequence event | Controller=" + controller + " | Shot=" + shot);
+                return true;
+            }
+        }
+        string message = "[SHOT] Controller=" + controller + " | Shot=" + shot;
+        Console.WriteLine(message);
+        LogMovement(message);
+        return true;
+    }
+
+    static bool TryProcessEjaculation(string line)
+    {
+        bool start = line.StartsWith("EJAC_START|Controller=", StringComparison.Ordinal);
+        bool end = line.StartsWith("EJAC_END|Controller=", StringComparison.Ordinal);
+        if (!start && !end) return false;
+
+        string controller = line.Substring((start ? "EJAC_START|Controller=" : "EJAC_END|Controller=").Length).Trim();
+        if (controller.Length == 0 || controller.Length > 80 || controller.Contains('|'))
+        {
+            Console.WriteLine("[EJAC] Ignored malformed event");
+            return true;
+        }
+
+        string message;
+        lock (EjaculationLock)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (start)
+            {
+                if (ejaculationStartedUtc.HasValue && ejaculationController == controller)
+                    message = "[EJAC] Duplicate START ignored | Controller=" + controller;
+                else
+                {
+                    ejaculationStartedUtc = now;
+                    latestShotUtc = null;
+                    latestShotIndex = 0;
+                    latestShotController = "";
+                    ejaculationLastStartedUtc = now;
+                    ejaculationEndedUtc = null;
+                    ejaculationController = controller;
+                    message = "[EJAC] START | Controller=" + controller + " | UTC=" + now.ToString("O");
+                }
+            }
+            else if (!ejaculationStartedUtc.HasValue || ejaculationController != controller)
+                message = "[EJAC] END without matching START | Controller=" + controller;
+            else
+            {
+                double seconds = (now - ejaculationStartedUtc.Value).TotalSeconds;
+                ejaculationStartedUtc = null;
+                ejaculationEndedUtc = now;
+                ejaculationController = "";
+                message = "[EJAC] END | Controller=" + controller + " | Duration=" + seconds.ToString("F3", CultureInfo.InvariantCulture) + "s";
+            }
+        }
+        Console.WriteLine(message);
+        LogMovement(message);
+        return true;
+    }
+
+    static void ProcessGameEvent(string line)
+    {
+        if (TryProcessIntensity(line))
+            return;
+        if (TryProcessEjaculation(line))
+            return;
+        if (TryProcessShot(line))
+            return;
+
+        if (line == "GameHeartbeat")
+        {
+            lock (SimulationLock)
+            {
+                lastGameHeartbeat = DateTime.UtcNow;
+                gameActive = true;
+            }
+
+            // Also handles startup when the interaction controller was detected
+            // before the first heartbeat or device-list response.
+            TryAutoArmGush();
+            return;
+        }
+
+        Console.WriteLine("[MDRG EVENT] " + line);
+        LogMovement("[MDRG EVENT] " + line);
+        UpdateVirtualVibration(line);
+    }
+
+    static void PrintStatus()
+    {
+        lock (SimulationLock)
+        {
+            Console.WriteLine();
+            Console.WriteLine("[SIMULATION STATUS]");
+            Console.WriteLine(
+                "Current: " + currentIntensity.ToString("F1") + "%");
+            Console.WriteLine(
+                "Target: " + targetIntensity.ToString("F1") + "%");
+            Console.WriteLine(
+                "Speed: " + transitionSpeed + "% per second");
+            Console.WriteLine(
+                "Timeout: " + inactivityTimeout + " seconds");
+            Console.WriteLine(
+                "Game heartbeat active: " + gameActive);
+            Console.WriteLine("Movement stream: " + receivingMovement);
+            Console.WriteLine("Controller: " + movementController);
+            Console.WriteLine("Handler: " + movementHandler);
+            Console.WriteLine("Game speed: " + movementSpeed.ToString("F4", CultureInfo.InvariantCulture));
+            Console.WriteLine("Game target: " + movementTarget.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            Console.WriteLine("Game smoothed: " + movementSmoothed.ToString("F1", CultureInfo.InvariantCulture) + "%");
+            Console.WriteLine("Raw depth: " + (depthPositionValid ? depthRawPosition.ToString("F4", CultureInfo.InvariantCulture) : "N/A"));
+            Console.WriteLine("Normalized depth (diagnostic): " +
+                (normalizedDepthValid ? normalizedDepth.ToString("F1", CultureInfo.InvariantCulture) + "%" : "N/A") +
+                " [" + depthCalibration + "]");
+            Console.WriteLine("Emergency stop: " + emergencyStopped);
+            Console.WriteLine("Physical armed: " + physicalArmed);
+            Console.WriteLine();
+        }
+    }
+
+    static async Task SendMessage(
+        ClientWebSocket socket,
+        string message,
+        CancellationToken token)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(message);
+
+        await socket.SendAsync(
+            new ArraySegment<byte>(bytes),
+            WebSocketMessageType.Text,
+            true,
+            token);
+    }
+
+    static async Task<string> ReceiveMessage(
+        ClientWebSocket socket,
+        CancellationToken token)
+    {
+        byte[] buffer = new byte[8192];
+
+        using var stream = new MemoryStream();
+
+        WebSocketReceiveResult result;
+
+        do
+        {
+            result = await socket.ReceiveAsync(
+                new ArraySegment<byte>(buffer),
+                token);
+
+            if (result.MessageType ==
+                WebSocketMessageType.Close)
+            {
+                throw new WebSocketException(
+                    "Intiface closed the connection.");
+            }
+
+            stream.Write(buffer, 0, result.Count);
+
+        } while (!result.EndOfMessage);
+
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    static async Task MonitorIntiface(
+        ClientWebSocket socket,
+        CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested &&
+                   socket.State == WebSocketState.Open)
+            {
+                string message =
+                    await ReceiveMessage(socket, token);
+
+                ProcessIntifaceMessage(message);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(
+                "[INTIFACE] Connection ended: " + ex.Message);
+        }
+        finally
+        {
+            lock (SimulationLock)
+            {
+                physicalArmed = false;
+                outputLoopHealthy = false;
+            }
+        }
+    }
+
+    static void ProcessIntifaceMessage(string message)
+    {
+        try
+        {
+            using JsonDocument document =
+                JsonDocument.Parse(message);
+
+            foreach (JsonElement entry in
+                document.RootElement.EnumerateArray())
+            {
+                if (entry.TryGetProperty(
+                    "DeviceList", out JsonElement deviceList))
+                {
+                    lock (DeviceLock)
+                    {
+                        Devices.Clear();
+
+                        foreach (JsonElement device in
+                            deviceList.GetProperty("Devices")
+                                .EnumerateArray())
+                        {
+                            DeviceInfo info = ParseDevice(device);
+                            Devices[info.Index] = info;
+                            PrintDevice(info, "DETECTED");
+                        }
+                    }
+                    RefreshMotorMappings();
+                }
+
+                if (entry.TryGetProperty(
+                    "DeviceAdded", out JsonElement added))
+                {
+                    DeviceInfo info = ParseDevice(added);
+
+                    lock (DeviceLock)
+                        Devices[info.Index] = info;
+
+                    PrintDevice(info, "CONNECTED");
+                    RefreshMotorMappings();
+                }
+
+                if (entry.TryGetProperty(
+                    "DeviceRemoved", out JsonElement removed))
+                {
+                    int index = removed
+                        .GetProperty("DeviceIndex")
+                        .GetInt32();
+
+                    lock (DeviceLock)
+                    {
+                        if (Devices.TryGetValue(
+                            index, out DeviceInfo? info))
+                        {
+                            Console.WriteLine(
+                                "[DEVICE REMOVED] " + info.Name);
+                            Devices.Remove(index);
+                        }
+                        else
+                        {
+                            Console.WriteLine(
+                                "[DEVICE REMOVED] Index " + index);
+                        }
+                    }
+                    RefreshMotorMappings();
+                }
+
+                if (entry.TryGetProperty(
+                    "Error", out JsonElement error))
+                {
+                    Console.WriteLine(
+                        "[INTIFACE ERROR] " + error);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(
+                "[INTIFACE] Parse error: " + ex.Message);
+        }
+    }
+
+    static void PrintLinears()
+    {
+        lock (SimulationLock)
+        {
+            if (LinearAxes.Count == 0) { Console.WriteLine("[LINEAR] No linear axes detected."); return; }
+            for (int i=0;i<LinearAxes.Count;i++)
+            {
+                var a=LinearAxes[i];
+                Console.WriteLine($"[LINEAR] {i+1}: {a.Name} device={a.DeviceIndex} axis={a.FeatureIndex} enabled={a.Enabled} range={a.Min:P0}..{a.Max:P0} reverse={a.Reverse} duration={a.DurationMs}ms wavesmooth={a.WaveSmoothSeconds:F2}s");
+            }
+        }
+    }
+    static bool ConfigureLinear(string command)
+    {
+        var parts=command.Split(' ',StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0 || !parts[0].Equals("linear",StringComparison.OrdinalIgnoreCase)) return false;
+        if (parts.Length != 4 && parts.Length != 3)
+        { Console.WriteLine("[LINEAR] Usage: linear N on|off OR linear N min|max|duration|reverse|wavesmooth VALUE"); return true; }
+        if (!int.TryParse(parts[1],out int n)) { Console.WriteLine("[LINEAR] Invalid index"); return true; }
+        lock (SimulationLock)
+        {
+            if (n<1 || n>LinearAxes.Count) { Console.WriteLine("[LINEAR] Axis not found. Use linears."); return true; }
+            var a=LinearAxes[n-1];
+            string field=parts[2].ToLowerInvariant();
+            string value=parts.Length==3 ? field : parts[3].ToLowerInvariant();
+            bool? boolean=value is "on" or "1" or "true" ? true : value is "off" or "0" or "false" ? false : null;
+            if (parts.Length==3 && boolean.HasValue) { a.Enabled=boolean.Value; a.LastPosition=double.NaN; }
+            else if (field=="reverse" && boolean.HasValue) a.Reverse=boolean.Value;
+            else if (double.TryParse(value,NumberStyles.Float,CultureInfo.InvariantCulture,out double v))
+            {
+                if (field=="min" && v>=0 && v<=100 && v/100<a.Max) a.Min=v/100;
+                else if (field=="max" && v>=0 && v<=100 && v/100>a.Min) a.Max=v/100;
+                else if (field=="duration" && v>=50 && v<=2000) a.DurationMs=(int)v;
+                else if (field=="wavesmooth" && v>=0 && v<=1) a.WaveSmoothSeconds=v;
+                else Console.WriteLine("[LINEAR] Invalid range or value");
+            }
+            else Console.WriteLine("[LINEAR] Invalid command");
+            Console.WriteLine($"[LINEAR] {a.Name} enabled={a.Enabled} range={a.Min:P0}..{a.Max:P0} reverse={a.Reverse} duration={a.DurationMs}ms wavesmooth={a.WaveSmoothSeconds:F2}s");
+        }
+        return true;
+    }
+    static void RefreshMotorMappings()
+    {
+        List<(int index, string name, int[] features)> devices;
+        lock (DeviceLock)
+            devices = Devices.Values.OrderBy(d => d.Index)
+                .Select(d => (d.Index, d.Name, d.VibrationIndices.ToArray())).ToList();
+        lock (SimulationLock)
+        {
+            var old = Motors.ToDictionary(m => $"{m.DeviceIndex}:{m.FeatureIndex}");
+            Motors.Clear();
+            foreach (var d in devices)
+                foreach (int feature in d.features)
+                {
+                    string key = $"{d.index}:{feature}";
+                    if (old.TryGetValue(key, out var existing))
+                    { existing.Name = d.name + (d.features.Length > 1 ? $" / vibration {feature+1}" : ""); Motors.Add(existing); }
+                    else Motors.Add(new MotorSetting(d.name + (d.features.Length > 1 ? $" / vibration {feature+1}" : ""), d.index, feature));
+                }
+        }
+        lock (DeviceLock)
+        lock (SimulationLock)
+        {
+            var old=LinearAxes.ToDictionary(a=>$"{a.DeviceIndex}:{a.FeatureIndex}");
+            LinearAxes.Clear();
+            foreach (var d in Devices.Values.OrderBy(d=>d.Index))
+                foreach (int index in d.LinearIndices)
+                {
+                    string key=$"{d.Index}:{index}";
+                    if (old.TryGetValue(key,out var previous))
+                    { previous.Name=d.Name; LinearAxes.Add(previous); }
+                    else LinearAxes.Add(new LinearSetting(d.Name,d.Index,index));
+                }
+        }
+        Console.WriteLine($"[INTIFACE] Mapped {Motors.Count} vibration channels and {LinearAxes.Count} linear axes. Use motors / linears.");
+    }
+
+    static DeviceInfo ParseDevice(JsonElement device)
+    {
+        var info = new DeviceInfo
+        {
+            Index = device.GetProperty(
+                "DeviceIndex").GetInt32(),
+
+            Name = device.GetProperty(
+                "DeviceName").GetString()
+                ?? "Unknown device"
+        };
+
+        if (device.TryGetProperty(
+            "DeviceMessages", out JsonElement messages) &&
+            messages.TryGetProperty(
+                "ScalarCmd", out JsonElement commands))
+        {
+            int scalarIndex = 0;
+            foreach (JsonElement command in
+                commands.EnumerateArray())
+            {
+                string actuator =
+                    command.GetProperty("ActuatorType")
+                        .GetString() ?? "";
+
+                if (actuator.Equals(
+                    "Vibrate",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    info.VibrationFeatures++;
+                    info.VibrationIndices.Add(scalarIndex);
+
+                    if (command.TryGetProperty(
+                        "StepCount", out JsonElement steps))
+                    {
+                        info.StepCounts.Add(steps.GetInt32());
+                    }
+                }
+                scalarIndex++;
+            }
+        }
+
+        if (device.TryGetProperty("DeviceMessages",out JsonElement linearMessages) &&
+            linearMessages.TryGetProperty("LinearCmd",out JsonElement linearCommands) &&
+            linearCommands.ValueKind==JsonValueKind.Array)
+        {
+            for(int i=0;i<linearCommands.GetArrayLength();i++) info.LinearIndices.Add(i);
+        }
+        return info;
+    }
+
+    static void PrintDevice(DeviceInfo info, string status)
+    {
+        Console.WriteLine(
+            "[DEVICE " + status + "] " + info.Name);
+        Console.WriteLine("  Index: " + info.Index);
+        Console.WriteLine(
+            "  Vibration features: " + info.VibrationFeatures);
+        Console.WriteLine(
+            "  Step counts: " +
+            string.Join(", ", info.StepCounts));
+        Console.WriteLine("  Linear axes: " + info.LinearIndices.Count);
+        Console.WriteLine("  Linear output: AUTO-ENABLED when fresh game telemetry is available (unless stopped/disarmed)");
+    }
+
+    static void PrintDevices()
+    {
+        lock (DeviceLock)
+        {
+            if (Devices.Count == 0)
+            {
+                Console.WriteLine(
+                    "[DEVICES] No devices detected.");
+                return;
+            }
+
+            foreach (DeviceInfo device in Devices.Values)
+                PrintDevice(device, "AVAILABLE");
+        }
+    }
+
+    static async Task ListenForGame(
+        TcpListener listener,
+        CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            TcpClient client;
+
+            try
+            {
+                client =
+                    await listener.AcceptTcpClientAsync(token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (SocketException) when (
+                token.IsCancellationRequested)
+            {
+                break;
+            }
+
+            _ = HandleGameClient(client, token);
+        }
+    }
+
+    // Reply to the game's explicit request on the same loopback TCP connection.
+    // Intiface remains the source of truth; no physical-output commands are changed.
+    static string BuildDeviceSnapshot()
+    {
+        lock (DeviceLock)
+        {
+            var devices = Devices.Values.OrderBy(d => d.Index)
+                .Select(d => new {
+                    index = d.Index,
+                    name = d.Name,
+                    vibrationFeatures = d.VibrationFeatures,
+                    vibrationIndices = d.VibrationIndices.ToArray(),
+                    linearIndices = d.LinearIndices.ToArray()
+                }).ToArray();
+            return "DEVICE_SNAPSHOT|" + JsonSerializer.Serialize(devices);
+        }
+    }
+
+    static async Task WriteBridgeReply(TcpClient client, string reply, CancellationToken token)
+    {
+        byte[] payload = Encoding.UTF8.GetBytes(reply + "\n");
+        await client.GetStream().WriteAsync(payload, token);
+    }
+
+    // UI settings are configuration only: receiving them never arms or starts output.
+    // Physical-output multipliers are keyed by Intiface device index, not by the UI selection.
+    private static readonly Dictionary<int, double> websiteIntensityByDevice = new();
+    static void ApplyGameSettings(string encoded)
+    {
+        try
+        {
+            if (encoded.Length > 65536) return;
+            using var json = JsonDocument.Parse(Convert.FromBase64String(encoded));
+            var root = json.RootElement;
+            if (!root.TryGetProperty("version", out var version) || version.GetInt32() != 1) return;
+            bool Bool(JsonElement obj, string key, bool fallback) =>
+                obj.TryGetProperty(key, out var v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False) ? v.GetBoolean() : fallback;
+            double Number(JsonElement obj, string key, double fallback, double min, double max) =>
+                obj.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number &&
+                v.TryGetDouble(out double n) && double.IsFinite(n) && n >= min && n <= max ? n : fallback;
+            string String(JsonElement obj, string key, string fallback) =>
+                obj.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? fallback : fallback;
+            // A disabled sync switch prevents the website from changing live device settings.
+            if (!Bool(root, "syncEnabled", false)) return;
+            if (!root.TryGetProperty("channels", out var channels) || channels.ValueKind != JsonValueKind.Array) return;
+            lock (DeviceLock)
+            lock (SimulationLock)
+            {
+                // A complete device snapshot is sent on every settings update.
+                // Validate the index AND name before accepting each multiplier.
+                // Missing entries default to unity, never to another device's value.
+                websiteIntensityByDevice.Clear();
+                if (root.TryGetProperty("deviceIntensities", out var perDevice) &&
+                    perDevice.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var entry in perDevice.EnumerateArray())
+                    {
+                        if (entry.ValueKind != JsonValueKind.Object ||
+                            !entry.TryGetProperty("DeviceIndex", out var indexValue) ||
+                            !indexValue.TryGetInt32(out int index) ||
+                            !Devices.TryGetValue(index, out var device) ||
+                            device.Name != String(entry, "DeviceName", "")) continue;
+                        websiteIntensityByDevice[index] = Number(entry, "IntensityMultiplier", 1.0, 0, 1);
+                    }
+                }
+                foreach (var item in channels.EnumerateArray())
+                {
+                    if (!item.TryGetProperty("DeviceIndex", out var d) || !d.TryGetInt32(out int deviceIndex) ||
+                        !item.TryGetProperty("FeatureIndex", out var f) || !f.TryGetInt32(out int featureIndex)) continue;
+                    string deviceName = String(item, "DeviceName", "");
+                    if (!Devices.TryGetValue(deviceIndex, out var device) || device.Name != deviceName) continue;
+                    bool linear = Bool(item, "IsLinear", false);
+                    if (linear)
+                    {
+                        if (!device.LinearIndices.Contains(featureIndex)) continue;
+                        var a = LinearAxes.FirstOrDefault(x => x.DeviceIndex == deviceIndex && x.FeatureIndex == featureIndex);
+                        if (a == null) continue;
+                        a.Enabled = Bool(item, "Enabled", a.Enabled);
+                        double min = Number(item, "MinimumTravel", a.Min, 0, 1);
+                        double max = Number(item, "MaximumTravel", a.Max, 0, 1);
+                        if (min < max) { a.Min = min; a.Max = max; }
+                        a.WaveSmoothSeconds = Number(item, "StrokeSmoothing", a.WaveSmoothSeconds, 0, 1);
+                        a.Reverse = Bool(item, "ReverseStroke", a.Reverse);
+                        a.LastPosition = double.NaN;
+                    }
+                    else
+                    {
+                        if (!device.VibrationIndices.Contains(featureIndex)) continue;
+                        var m = Motors.FirstOrDefault(x => x.DeviceIndex == deviceIndex && x.FeatureIndex == featureIndex);
+                        if (m == null) continue;
+                        m.Enabled = Bool(item, "Enabled", m.Enabled);
+                        m.Multiplier = Number(item, "VibrationMultiplier", m.Multiplier, 0, 2);
+                        m.MaxPercent = Number(item, "VibrationCap", m.MaxPercent / 100, 0, 1) * 100;
+                        m.DepthCurve = Number(item, "Curve", m.DepthCurve, 0.5, 4);
+                        m.SmoothSeconds = Number(item, "Smoothing", m.SmoothSeconds, 0, 1);
+                        m.StopFadeSeconds = Number(item, "StopFade", m.StopFadeSeconds, 0, 1);
+                        string source = String(item, "ResponseSource", m.Source).ToLowerInvariant();
+                        if (source is "hybrid" or "depth" or "speed") m.Source = source;
+                        m.StopOnZeroSpeed = Bool(item, "ZeroSpeedCutoff", m.StopOnZeroSpeed);
+                        m.IdleEnabled = Bool(item, "IdleResponse", m.IdleEnabled);
+                        bool orgasm = Bool(root, "orgasmResponseEnabled", true);
+                        m.EjacMode = orgasm ? (String(root, "orgasmShotOverrideMode", "Override") == "Additive" ? "shot-additive" : "shot-override") : "off";
+                        m.EjacIntensity = Number(root, "orgasmShotIntensity", m.EjacIntensity / 100, 0, 1) * 100 * Number(root, "orgasmSensitivity", 0.5, 0, 1);
+                        m.EjacPulse = Number(root, "orgasmShotPulseDuration", m.EjacPulse, 0.05, 1);
+                        m.EjacFade = Number(root, "orgasmShotFadeDuration", m.EjacFade, 0, 1);
+                    }
+                }
+            }
+            Console.WriteLine("[SETTINGS] Applied validated settings to detected actuators; output arming unchanged.");
+        }
+        catch (Exception ex) { Console.WriteLine("[SETTINGS] Ignored invalid payload: " + ex.Message); }
+    }
+
+    static async Task HandleGameClient(
+        TcpClient client,
+        CancellationToken token)
+    {
+        using (client)
+        {
+            try
+            {
+                using var reader = new StreamReader(
+                    client.GetStream(),
+                    Encoding.UTF8);
+
+                while (!token.IsCancellationRequested)
+                {
+                    string? line =
+                        await reader.ReadLineAsync(token);
+
+                    if (line == null)
+                        break;
+
+                    if (line == "INTIFACE_CONNECT")
+                    {
+                        await ConnectIntiface();
+                        await WriteBridgeReply(client, ConnectionReply(), token);
+                        continue;
+                    }
+                    if (line == "INTIFACE_DISCONNECT")
+                    {
+                        await DisconnectIntiface();
+                        await WriteBridgeReply(client, ConnectionReply(), token);
+                        continue;
+                    }
+                    if (line == "INTIFACE_STATUS_REQUEST")
+                    {
+                        await WriteBridgeReply(client, ConnectionReply(), token);
+                        continue;
+                    }
+                    if (line.StartsWith("BRIDGE_SETTINGS|", StringComparison.Ordinal))
+                    {
+                        ApplyGameSettings(line.Substring("BRIDGE_SETTINGS|".Length));
+                        continue;
+                    }
+                    if (line == "DEVICE_SNAPSHOT_REQUEST")
+                    {
+                        await WriteBridgeReply(client, BuildDeviceSnapshot(), token);
+                        continue;
+                    }
+                    ProcessGameEvent(line);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+        }
+    }
+
+    class DeviceInfo
+    {
+        public int Index { get; set; }
+        public string Name { get; set; } = "";
+        public int VibrationFeatures { get; set; }
+        public List<int> StepCounts { get; set; } = new();
+        public List<int> VibrationIndices { get; set; } = new();
+        public List<int> LinearIndices { get; set; } = new();
+    }
+}
